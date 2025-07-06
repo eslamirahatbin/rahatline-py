@@ -2,10 +2,13 @@ import jwt
 import asyncio
 import logging
 from .models import *
-from typing import Optional, List, Callable
+from typing import Optional, List, Callable, Coroutine, Any
 from .ws_signaling import WebSocketSignaling
+from .media_stream import RlMediaStreamTrack
 from .webrtc import RahatLineWebRTCConnection
 from aiortc import RTCIceCandidate, MediaStreamTrack
+from aiortc.contrib.media import MediaRelay
+
 from .completion_source import FutureCompletionSource
 
 class RahatLine:
@@ -17,13 +20,14 @@ class RahatLine:
         self._signaling = signaling
         # self._peer_connection: Optional[RTCPeerConnection] = None
         self._connection_state: str = "new"
+        self.relay = MediaRelay()
         # self._media_streams: List[RlMediaStream] = []
         self._connect_to_peer_promise = FutureCompletionSource()
 
         # Event handlers
         self.client_leave: Optional[Callable[[Client], None]] = None
         self.new_client_connected: Optional[Callable[[Client], None]] = None
-        # self.on_new_audio_stream: Optional[Callable[[RlAudioStream], None]] = None
+        self.on_new_stream: Callable[[MediaStreamTrack, str, Any], Coroutine[None, None, None]] = None
         # self.on_new_video_stream: Optional[Callable[[RlVideoStream], None]] = None
         # self.on_video_stream_closed: Optional[Callable[[RlVideoStream], None]] = None
         # self.on_audio_stream_closed: Optional[Callable[[RlAudioStream], None]] = None
@@ -67,14 +71,21 @@ class RahatLine:
     async def _on_ice_candidate(self, ice: RTCIceCandidate):
         await self._signaling.SendMyIceCandidate(ice)
 
-    def _on_new_track(self, stream: MediaStreamTrack):
-        if "_" not in stream.id:
-            return
+    async def _on_new_track(self, stream: MediaStreamTrack):
+        # print(stream.id)
+        # if "_" not in stream.id:
+        #     return
             
-        client_id = stream.id.split("_")[0]
-        client = next((c for c in self._signaling.clients if c.id == client_id), None)
-        if not client:
-            return
+        # client_id = stream.id.split("_")[0]
+        # client = next((c for c in self._signaling._clients if c.id == client_id), None)
+        # if not client:
+        #     return
+        # logging.info(f'added new track {stream.id}')
+
+        #m = RlMediaStreamTrack.Init(self.relay.subscribe(stream))
+        await self.on_new_stream(stream)
+
+        
         
 
 
@@ -91,8 +102,7 @@ class RahatLine:
             self.on_connection_state_changed(state)
 
     async def _on_server_offer(self, sdp: SessionDescription):
-        offer = SessionDescription(sdp.sdp, sdp.type)
-        answer = await self._peer_connection.negotiate(offer)
+        answer = await self._peer_connection.negotiate(sdp)
         await self._signaling.SendMyAnswer(SessionDescription(answer.sdp, answer.type))
 
     async def _on_server_answer(self, answer: SessionDescription):

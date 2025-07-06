@@ -2,7 +2,8 @@ import asyncio
 import logging
 from typing import List
 from .models.turn_info import TurnInfo
-from typing import Optional, List, Callable, Dict, Any
+from .models import SessionDescription
+from typing import Optional, List, Callable, Dict, Any, Coroutine
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceCandidate, MediaStreamTrack, RTCRtpTransceiver
 from aiortc.contrib.media import MediaRelay
 
@@ -28,7 +29,7 @@ class RahatLineWebRTCConnection:
         # self.OnRemoveTrack: Optional[Callable[[str, str], None]] = None
         self.OnConnectionStateChanged: Optional[Callable[[str], None]] = None
         self.OnIceCandidate: Optional[Callable[[RTCIceCandidate], None]] = None
-        self.OnNewTrack: Optional[Callable[[MediaStreamTrack], None]] = None
+        self.OnNewTrack: Callable[[MediaStreamTrack, str, Any], Coroutine[None, None, None]] = None
 
 
         loop = asyncio.get_event_loop()
@@ -36,30 +37,34 @@ class RahatLineWebRTCConnection:
         
         @self._pc.on("icegatheringstatechange")
         def on_icegatheringstatechange():
+            if self.future.done(): return
             if self._pc.iceGatheringState == "complete":
                 self.future.set_result(None)
         
 
         @self._pc.on('track')
-        def on_track(track: MediaStreamTrack):
-            if self.OnNewTrack:
-                self.OnNewTrack(track.kind, track.id)
+        async def on_track(track: MediaStreamTrack):
+            await self.OnNewTrack(track)
+            # self.OnNewTrack(track)
+            # while True:
+            #     r = await track.recv()
+            #     print(r)
+            
 
         @self._pc.on("connectionstatechange")
         def on_connectionstatechange():
-            if self.OnConnectionStateChanged:
-                self.OnConnectionStateChanged(self._pc.connectionState)
+            self.OnConnectionStateChanged(self._pc.connectionState)
 
 
     # def Connect(self): self._pc.c
 
 
 
-    async def negotiate(self, server_offer: Optional[RTCSessionDescription] = None) -> RTCSessionDescription:
+    async def negotiate(self, server_offer: Optional[SessionDescription] = None) -> RTCSessionDescription:
         if server_offer is None:
             return await self._create_offer()
         else:
-            return await self._create_answer(server_offer)
+            return await self._create_answer(RTCSessionDescription(sdp=server_offer.sdp, type=server_offer.type))
     
 
     def AddTrack(self, track: MediaStreamTrack):
