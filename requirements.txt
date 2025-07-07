@@ -1,3 +1,9 @@
 pyjwt==2.3.0
 websockets==15.0.1
 aiortc==1.13.0
+noisereduce
+soundfile
+sounddevice
+librosa
+numpy
+openai-whisper

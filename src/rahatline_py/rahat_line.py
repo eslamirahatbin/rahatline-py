@@ -1,139 +1,96 @@
-import jwt
 import asyncio
-import logging
-from .models import *
-from typing import Optional, List, Callable, Coroutine, Any
-from .ws_signaling import WebSocketSignaling
-from .media_stream import RlMediaStreamTrack
-from .webrtc import RahatLineWebRTCConnection
-from aiortc import RTCIceCandidate, MediaStreamTrack
-from aiortc.contrib.media import MediaRelay
+import numpy as np
+import whisper
+import noisereduce as nr
+import soundfile as sf
+from av.audio.frame import AudioFrame
+import librosa
+from threading import Thread
+from queue import Queue
 
-from .completion_source import FutureCompletionSource
+import sys
+import os
 
-class RahatLine:
-
-    def __init__(self, signaling: WebSocketSignaling):
-        self._signaling = signaling
-
-        self._my_id: str = ""
-        self._signaling = signaling
-        # self._peer_connection: Optional[RTCPeerConnection] = None
-        self._connection_state: str = "new"
-        self.relay = MediaRelay()
-        # self._media_streams: List[RlMediaStream] = []
-        self._connect_to_peer_promise = FutureCompletionSource()
-
-        # Event handlers
-        self.client_leave: Optional[Callable[[Client], None]] = None
-        self.new_client_connected: Optional[Callable[[Client], None]] = None
-        self.on_new_stream: Callable[[MediaStreamTrack, str, Any], Coroutine[None, None, None]] = None
-        # self.on_new_video_stream: Optional[Callable[[RlVideoStream], None]] = None
-        # self.on_video_stream_closed: Optional[Callable[[RlVideoStream], None]] = None
-        # self.on_audio_stream_closed: Optional[Callable[[RlAudioStream], None]] = None
-        self.on_connection_state_changed: Optional[Callable[[str], None]] = None
-
-        self._bootstrap_signaling(signaling)
+# اضافه کردن مسیر بالایی به path
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 
-    @staticmethod
-    def Initialize(address: str, port: int, roomId: str, jwt_secret: str, protocol = 'ws', path: str = "/ws", systemId: str = 'python-agent')->'RahatLine':
-        token = jwt.encode({"roomId": roomId,"isSystem": True,"clientPayload": systemId,}, jwt_secret, "HS256")
+from aiortc import MediaStreamTrack
+from rahatline_py import RahatLine, RlMediaStreamTrack
 
-        ws = WebSocketSignaling(address, port, token, path, protocol)
-        return RahatLine(ws)
-    
-    async def Connect(self)-> str:
+model = whisper.load_model("turbo", in_memory=True, device='cuda').to('cuda')
+
+
+
+# صف برای فریم‌های آماده ترجمه
+transcription_queue = Queue()
+
+# تنظیمات
+duration_seconds = 5
+sample_rate = 48000
+channels = 2
+collected = []
+collected_samples = 0
+
+def collect_and_enqueue_for_transcription(frame):
+    global collected_samples
+
+    raw = frame.to_ndarray().flatten()
+    try:
+        samples = raw.reshape(-1, channels).astype(np.float32) / 32768.0
+    except ValueError:
+        print("[!] خطا در تبدیل فریم به numpy")
+        return
+
+    collected.append(samples)
+    collected_samples += samples.shape[0]
+
+    if collected_samples >= duration_seconds * sample_rate:
+        audio = np.concatenate(collected, axis=0)
+        mono = np.mean(audio, axis=1)
+        transcription_queue.put(mono.copy())  # ← بنداز تو صف
+
+        collected.clear()
+        collected_samples = 0
+
+def transcription_worker():
+    while True:
+        mono = transcription_queue.get()
+        if mono is None:
+            break
         try:
-            info = await self._signaling.Connect()
-            self._connect_to_peer_promise = FutureCompletionSource()
-            self._bootstrap_peer_connection(info)
-            
-            await self._start_local_negotiation()
-            await self._connect_to_peer_promise.Promise
-            
-            self._my_id = info.id
-            return info.id
+            resampled = librosa.resample(mono, orig_sr=sample_rate, target_sr=16000)
+            result = model.transcribe(resampled, beam_size=10, temperature=0.3, language="fa")
+            print("📝 نتیجه:", result["text"])
         except Exception as e:
-            logging.error(f"Connection error: {e}")
-            raise
-    
-    def close(self):
-        if self._peer_connection:
-            asyncio.create_task(self._peer_connection.close())
-        if self._signaling:
-            self._signaling.close()
+            print("[!] خطا در whisper:", e)
 
-    async def _start_local_negotiation(self):
-        sdp = await self._peer_connection.negotiate()
-        await self._signaling.SendMyOffer(SessionDescription(sdp.sdp, sdp.type))
-
-    async def _on_ice_candidate(self, ice: RTCIceCandidate):
-        await self._signaling.SendMyIceCandidate(ice)
-
-    async def _on_new_track(self, stream: MediaStreamTrack):
-        # print(stream.id)
-        # if "_" not in stream.id:
-        #     return
-            
-        # client_id = stream.id.split("_")[0]
-        # client = next((c for c in self._signaling._clients if c.id == client_id), None)
-        # if not client:
-        #     return
-        # logging.info(f'added new track {stream.id}')
-
-        #m = RlMediaStreamTrack.Init(self.relay.subscribe(stream))
-        await self.on_new_stream(stream)
-
-        
-        
+# راه‌اندازی ترد جداگانه
+thread = Thread(target=transcription_worker, daemon=True)
+thread.start()
 
 
-    def _on_connection_state_changed(self, state: str):
-        self._connection_state = state
-        
-        if not self._connect_to_peer_promise.Promise.done():
-            if state == "connected":
-                self._connect_to_peer_promise.Resolve(None)
-            elif state != "connecting":
-                self._connect_to_peer_promise.Reject("failed to connect")
-                
-        if self.on_connection_state_changed:
-            self.on_connection_state_changed(state)
+ROOM_ID = '1'
+JWT_SECRET = 'Key-Must-Be-at-least-32-bytes-in-length!'
+# model = whisper.load_model("medium").to('cuda')
 
-    async def _on_server_offer(self, sdp: SessionDescription):
-        answer = await self._peer_connection.negotiate(sdp)
-        await self._signaling.SendMyAnswer(SessionDescription(answer.sdp, answer.type))
+async def main():
+    conn = RahatLine.Initialize('178.252.132.186', 8080, ROOM_ID, JWT_SECRET)
 
-    async def _on_server_answer(self, answer: SessionDescription):
-        await self._peer_connection.complete_local_negotiation(SessionDescription(answer.sdp, answer.type))
-
-    def _bootstrap_signaling(self, signaling):
-        signaling.OnNewClientJoined = lambda c: (
-            self.new_client_connected(c) 
-            if self.new_client_connected and self.my_id and c.id != self.my_id 
-            else None
-        )
-        
-        signaling.OnClientLeave = lambda c: (
-            self.client_leave(c) 
-            if self.client_leave 
-            else None
-        )
-        
-        signaling.OnServerSendOffer = lambda sdp: (
-            asyncio.create_task(self._on_server_offer(sdp)))
-        
-        signaling.OnServerSendAnswer = lambda answer: (
-            asyncio.create_task(self._on_server_answer(answer)))
-
-    def _bootstrap_peer_connection(self, info: ClientInfo):
-        self._peer_connection = RahatLineWebRTCConnection(info.turn)
-        
-        self._peer_connection.OnIceCandidate = lambda ice: self._on_ice_candidate(ice)
-        self._peer_connection.OnConnectionStateChanged = lambda s: self._on_connection_state_changed(s)
-        self._peer_connection.OnNewTrack = lambda stream: self._on_new_track(stream)
+    async def track(s: MediaStreamTrack):
+        while True:
+            frame = await s.recv()
+            collect_and_enqueue_for_transcription(frame)
 
 
+    conn.on_new_stream = lambda s: track(s)
 
+    id = await conn.Connect()
+    print(id)
 
+    try:
+        while True:
+            await asyncio.sleep(1)
+    except KeyboardInterrupt: pass
+
+asyncio.run(main())
